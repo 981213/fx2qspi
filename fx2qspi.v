@@ -4,6 +4,10 @@
  * and FX_EMPTY is FLAGB configured to indicate EP2_OUT empty
  * All control pins on FX2 are active low
  * FIFOADR0 should be connected to ground
+ * reset procedure:
+ * write 4096 byte of 0
+ * write [0x60, 0x00]
+ * drain FX2 EP6
  */
 module fx2qspi(
 	input FX_IFCLK,
@@ -13,7 +17,7 @@ module fx2qspi(
 	output reg FX_SLOE,
 	output reg FX_SLRD,
 	output reg FX_SLWR,
-	output reg FX_PKTEND,
+	output FX_PKTEND,
 	inout [7:0]FX_DATA,
 	output SPI_CS,
 	output SPI_CLK,
@@ -32,7 +36,7 @@ assign SPI_CS = ~op_cs;
 reg op_dir; // 0: out 1: in
 localparam DIR_OUT = 1'b0, DIR_IN = 1'b1;
 reg [1:0]op_mode; // 10: QPI 01: DPI 00: SPI
-localparam MODE_QPI = 2'b10, MODE_DPI = 2'b01, MODE_SPI = 2'b00;
+localparam MODE_QPI = 2'b10, MODE_DPI = 2'b01, MODE_SPI = 2'b00, MODE_TRG_PKTEND = 2'b11;
 reg [11:0]op_len;
 
 // Data buffer for FX2 FIFO
@@ -298,12 +302,13 @@ end
  *    There may be a glitch on 4->0 (4->3->0) but it doesn't matter
  *    here.
  */
- reg fx2_write_pktend;
- reg fx2_write_trigger;
- reg [2:0]fx2_write_state;
- reg [2:0]fx2_write_next_state;
- wire fx2_write_busy;
- localparam fx2_write_s0 = 3'b000,
+reg fx2_write_pktend;
+reg fx2_write_pktend_out;
+reg fx2_write_trigger;
+reg [2:0]fx2_write_state;
+reg [2:0]fx2_write_next_state;
+wire fx2_write_busy;
+localparam fx2_write_s0 = 3'b000,
 	fx2_write_s1 = 3'b001,
 	fx2_write_s2 = 3'b011,
 	fx2_write_s3 = 3'b010,
@@ -331,11 +336,18 @@ end
 
 always @(fx2_write_state, FX_FULL, fx2_write_pktend) begin
 	case (fx2_write_state)
-		fx2_write_s2: {fx2_fpga_oe, FX_SLWR, FX_PKTEND} = 3'b101;
-		fx2_write_s4: {fx2_fpga_oe, FX_SLWR, FX_PKTEND} = 3'b010;
-		default: {fx2_fpga_oe, FX_SLWR, FX_PKTEND} = 3'b011;
+		fx2_write_s2: {fx2_fpga_oe, FX_SLWR, fx2_write_pktend_out} = 3'b101;
+		fx2_write_s4: {fx2_fpga_oe, FX_SLWR, fx2_write_pktend_out} = 3'b010;
+		default: {fx2_fpga_oe, FX_SLWR, fx2_write_pktend_out} = 3'b011;
 	endcase
 end
+
+/*
+ * When FX2 start before FPGA, 1 byte may be written into FIFO during
+ * FPGA initialization. This additional mode asserts FX_PKTEND to commit
+ * current active buffer.
+ */
+assign FX_PKTEND = fx2_write_pktend_out & (op_mode != MODE_TRG_PKTEND);
 
 /* main stuff */
 
@@ -527,5 +539,5 @@ always @(*) begin
 		main_s14: n_fx2_write_pktend = fx2_write_pktend;
 	endcase
 end
-assign {LED_R, LED_G, LED_B} = {fx2_read_busy , qspi_busy , fx2_write_busy};
+assign {LED_R, LED_G, LED_B} = 3'b111;
 endmodule
