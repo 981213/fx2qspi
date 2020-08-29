@@ -362,6 +362,13 @@ end
 
 wire data_left;
 assign data_left = |datalen;
+
+reg data_store;
+always @(posedge data_store) begin
+	fx2_write_data <= qspi_in_val;
+	qspi_out_data <= fx2_read_data;
+end
+
 /*
  * main FSM
  * 0: trigger a byte read
@@ -373,9 +380,13 @@ assign data_left = |datalen;
  * 6: release stage 2 clock
  * 7: trigger op1 (read a byte for writing, or trigger spi for reading)
  * 8: wait op1
- * 9: trigger op2 (trigger spi for writing or write the byte back to fx2 for reading) and count down
+ * 9: save op1 result
+ * 10: trigger op12
+ * 11: wait op12
+ * 12: save op1 result
+ * 13: trigger op2 (trigger spi for writing or write the byte back to fx2 for reading)
  *    be careful about pktend processing
- * 10: wait op2 and hold pktend
+ * 14: wait op2 and hold pktend
  * I can't design a glitch-free state here so glitch removal for output is mandatory.
  */
 localparam main_s0 = 4'b0000,
@@ -388,7 +399,11 @@ localparam main_s0 = 4'b0000,
 	main_s7 = 4'b0100,
 	main_s8 = 4'b1100,
 	main_s9 = 4'b1101,
-	main_s10 = 4'b1111;
+	main_s10 = 4'b1111,
+	main_s11 = 4'b1110,
+	main_s12 = 4'b1010,
+	main_s13 = 4'b1011,
+	main_s14 = 4'b1001;
 
 reg [3:0]main_state;
 reg [3:0]main_next_state;
@@ -407,9 +422,13 @@ end
  * 5: go 6
  * 6: go 0 if no data left otherwise go 7
  * 7: go 8
- * 8: go 9
- * 9: go 10
- * 10: go 6
+ * 8: busy wait. go 9
+ * 9: go 13 if no data left otherwise go 10
+ * 10: go 11
+ * 11: busy wait. go 12
+ * 12: go 13 if no data left otherwise go 10
+ * 13: go 14
+ * 14: busy wait. go 0
  */
 always @(*) begin
 	case (main_state)
@@ -422,52 +441,52 @@ always @(*) begin
 		main_s6: main_next_state = data_left ? main_s7 : main_s0;
 		main_s7: main_next_state = main_s8;
 		main_s8: main_next_state = (fx2_read_busy | qspi_busy) ? main_s8 : main_s9;
-		main_s9: main_next_state = main_s10;
-		main_s10: main_next_state = (fx2_write_busy | qspi_busy) ? main_s10 : main_s6;
+		main_s9: main_next_state = data_left ? main_s10 : main_s13;
+		main_s10: main_next_state = main_s11;
+		main_s11: main_next_state = (fx2_read_busy | qspi_busy | fx2_write_busy) ? main_s11 : main_s12;
+		main_s12: main_next_state = data_left ? main_s10 : main_s13;
+		main_s13: main_next_state = main_s14;
+		main_s14: main_next_state = (fx2_write_busy | qspi_busy) ? main_s14 : main_s0;
 		default: main_next_state = main_s0;
 	endcase
 end
 /*
  * Driving pins:
- * qspi_trigger qspi_out_data
- * fx2_write_data fx2_write_trigger fx2_write_pktend
+ * qspi_trigger fx2_write_trigger fx2_write_pktend
  * fx2_read_trigger
- * sample_stage1 sample_stage2 countdown
+ * sample_stage1 sample_stage2 countdown data_store
  * here's the glitch removal part
  */
 reg n_qspi_trigger;
-reg [7:0]n_qspi_out_data;
-reg [7:0]n_fx2_write_data;
 reg n_fx2_write_trigger;
 reg n_fx2_write_pktend;
 reg n_fx2_read_trigger;
 reg n_sample_stage1;
 reg n_sample_stage2;
 reg n_countdown;
+reg n_data_store;
 always @(posedge FX_IFCLK) begin
 	qspi_trigger <= n_qspi_trigger;
-	qspi_out_data <= n_qspi_out_data;
-	fx2_write_data <= n_fx2_write_data;
 	fx2_write_trigger <= n_fx2_write_trigger;
 	fx2_write_pktend <= n_fx2_write_pktend;
 	fx2_read_trigger <= n_fx2_read_trigger;
 	sample_stage1 <= n_sample_stage1;
 	sample_stage2 <= n_sample_stage2;
 	countdown <= n_countdown;
+	data_store <= n_data_store;
 end
 
 /* output */
 always @(*) begin
 	/* default values for all pins */
 	n_qspi_trigger = 1'b0;
-	n_qspi_out_data = 8'b0;
-	n_fx2_write_data = 8'b0;
 	n_fx2_write_trigger = 1'b0;
 	n_fx2_write_pktend = 1'b0;
 	n_fx2_read_trigger = 1'b0;
 	n_sample_stage1 = 1'b0;
 	n_sample_stage2 = 1'b0;
 	n_countdown = 1'b0;
+	n_data_store = 1'b0;
 	case (main_state)
 		main_s0: n_fx2_read_trigger = 1'b1;
 		// main_s1: nothing
@@ -483,26 +502,30 @@ always @(*) begin
 				n_qspi_trigger = 1'b1;
 			end
 		end
-		// main_s8: nothing
-		main_s9: begin
+		main_s8: n_countdown = 1'b1;
+		main_s9: n_data_store = 1'b1;
+		main_s10: begin
+			if (op_dir == DIR_OUT) begin
+				n_fx2_read_trigger = 1'b1;
+			end else begin
+				n_fx2_write_trigger = 1'b1;
+			end
+			n_qspi_trigger = 1'b1;
+		end
+		main_s11: n_countdown = 1'b1;
+		main_s12: n_data_store = 1'b1;
+		main_s13: begin
 			if (op_dir == DIR_OUT) begin
 				n_qspi_trigger = 1'b1;
 			end else begin
 				n_fx2_write_trigger = 1'b1;
-				if (datalen == 12'd1) begin
+				if (!data_left) begin
 					n_fx2_write_pktend = 1;
 				end
 			end
-			n_fx2_write_data = qspi_in_val;
-			n_qspi_out_data = fx2_read_data;
-			n_countdown = 1;
 		end
-		main_s10: begin
-			n_fx2_write_data = qspi_in_val;
-			n_qspi_out_data = fx2_read_data;
-			n_fx2_write_pktend = fx2_write_pktend;
-		end
+		main_s14: n_fx2_write_pktend = fx2_write_pktend;
 	endcase
 end
-assign {LED_R, LED_G, LED_B} = qspi_state[2:0];
+assign {LED_R, LED_G, LED_B} = {fx2_read_busy , qspi_busy , fx2_write_busy};
 endmodule
