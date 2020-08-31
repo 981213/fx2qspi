@@ -8,6 +8,8 @@
  * write 4096 byte of 0
  * write [0x60, 0x00]
  * drain FX2 EP6
+ *
+ * FIXME: SLRD and PKTEND doesn't meet FX2 timing constraint.
  */
 module fx2qspi(
 	input FX_IFCLK,
@@ -147,7 +149,7 @@ end
 
 assign SPI_CLK = qspi_op_clk | qspi_clk_gate;
 
-/* clock divider 45MHz/8 for my logic analyzer :P */
+/* clock divider for my logic analyzer :P */
 reg [3:0]clkdiv_counter;
 always @(negedge FX_IFCLK) begin
 	clkdiv_counter <= clkdiv_counter + 1;
@@ -226,8 +228,6 @@ reg fx2_fpga_oe;
 // output control. SLOE is active low and fx2_fpga_oe is active high.
 // Let's check both flags to make sure pin conflict doesn't happen.
 assign FX_DATA = fx2_fpga_oe ? fx2_write_data : 8'bz;
-// Setup FIFOADR using SLOE level: 10:EP6IN 00:EP2OUT
-assign FX_FIFOADR1 = FX_SLOE ? 1'b1 : 1'b0;
 
 /**
  * FX2 reading FSM
@@ -251,6 +251,13 @@ localparam fx2_read_s0 = 2'b00,
 
 // s0 is idle state and the rest are busy states
 assign fx2_read_busy = |fx2_read_state;
+/*
+ * Setup FIFOADR using SLOE level and busy state: 10:EP6IN 00:EP2OUT
+ * FIFOADR1 needs to be set 25ns before clk posedge however that's
+ * more than 1 clock period so setting FIFOADR1 with SLOE on state 2
+ * isn't enough.
+ */
+assign FX_FIFOADR1 = FX_SLOE & ~fx2_read_busy;
 
 // state transition
 always @(negedge FX_IFCLK, posedge fx2_read_trigger) begin
@@ -262,9 +269,13 @@ always @(negedge FX_IFCLK, posedge fx2_read_trigger) begin
 end
 
 // data sampling
+reg [7:0]fx_data_buf;
 always @(negedge FX_IFCLK) begin
-	if (fx2_read_next_state == fx2_read_s3) begin
-		fx2_read_data <= FX_DATA;
+	fx_data_buf <= FX_DATA;
+end
+always @(posedge FX_IFCLK) begin
+	if (fx2_read_state == fx2_read_s3) begin
+		fx2_read_data <= fx_data_buf;
 	end
 end
 
@@ -377,8 +388,11 @@ assign data_left = |datalen;
 
 reg data_store;
 always @(posedge data_store) begin
-	fx2_write_data <= qspi_in_val;
-	qspi_out_data <= fx2_read_data;
+	if (op_dir == DIR_IN) begin
+		fx2_write_data <= qspi_in_val;
+	end else begin
+		qspi_out_data <= fx2_read_data;
+	end
 end
 
 /*
@@ -532,7 +546,7 @@ always @(*) begin
 			end else begin
 				n_fx2_write_trigger = 1'b1;
 				if (!data_left) begin
-					n_fx2_write_pktend = 1;
+					n_fx2_write_pktend = 1'b1;
 				end
 			end
 		end
